@@ -1,35 +1,33 @@
 // Package idigbio is the library behind the idigbio command line:
-// the HTTP client, request shaping, and the typed data models for idigbio.
+// the HTTP client, request shaping, and the typed data models for iDigBio
+// (Integrated Digitized Biocollections).
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// transient failures (429 and 5xx) that any public API throws under load.
+// Search endpoints use POST with a JSON body; the count endpoint uses GET.
 package idigbio
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to idigbio. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
+// DefaultUserAgent identifies the client to iDigBio.
 const DefaultUserAgent = "idigbio/dev (+https://github.com/tamnd/idigbio-cli)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at idigbio.com; change it once you
-// know the real endpoints you want to read.
-const Host = "idigbio.com"
+// Host is the API host this client talks to.
+const Host = "search.idigbio.org"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+// BaseURL is the API root every request is built from.
+const BaseURL = "https://" + Host + "/v2"
 
-// Client talks to idigbio over HTTP.
+// Client talks to the iDigBio API over HTTP.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
@@ -40,20 +38,19 @@ type Client struct {
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with sensible defaults: a 30s timeout, a 300ms
+// minimum gap between requests, and three retries on transient errors.
 func NewClient() *Client {
 	return &Client{
 		HTTP:      &http.Client{Timeout: 30 * time.Second},
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Rate:      300 * time.Millisecond,
+		Retries:   3,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
+// Get fetches url and returns the response body. It paces and retries
+// according to the client's settings.
 func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.Retries; attempt++ {
@@ -64,7 +61,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, http.MethodGet, url, nil, "")
 		if err == nil {
 			return body, nil
 		}
@@ -76,13 +73,44 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 	return nil, fmt.Errorf("get %s: %w", url, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+// Post sends a JSON body to url and returns the response body. It paces and
+// retries on transient errors.
+func (c *Client) Post(ctx context.Context, url string, bodyBytes []byte) ([]byte, error) {
+	var lastErr error
+	for attempt := 0; attempt <= c.Retries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff(attempt)):
+			}
+		}
+		body, retry, err := c.do(ctx, http.MethodPost, url, bodyBytes, "application/json")
+		if err == nil {
+			return body, nil
+		}
+		lastErr = err
+		if !retry {
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("post %s: %w", url, lastErr)
+}
+
+func (c *Client) do(ctx context.Context, method, url string, bodyBytes []byte, contentType string) (body []byte, retry bool, err error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	var bodyReader io.Reader
+	if bodyBytes != nil {
+		bodyReader = bytes.NewReader(bodyBytes)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
 	if err != nil {
 		return nil, false, err
 	}
 	req.Header.Set("User-Agent", c.UserAgent)
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
@@ -123,78 +151,171 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on idigbio.com. It is a stand-in for the typed records you
-// will model from the real idigbio endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `idigbio cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// --- wire types ---
+
+type wireIndexTerms struct {
+	UUID            string `json:"uuid"`
+	ScientificName  string `json:"scientificname"`
+	Family          string `json:"family"`
+	Genus           string `json:"genus"`
+	Country         string `json:"country"`
+	CountryCode     string `json:"countrycode"`
+	Continent       string `json:"continent"`
+	BasisOfRecord   string `json:"basisofrecord"`
+	InstitutionCode string `json:"institutioncode"`
+	CatalogNumber   string `json:"catalognumber"`
+	Collector       string `json:"collector"`
+	DateCollected   string `json:"datecollected"`
+	TypeStatus      string `json:"typestatus"`
+	HasMedia        bool   `json:"hasMedia"`
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
+type wireRecord struct {
+	UUID       string         `json:"uuid"`
+	IndexTerms wireIndexTerms `json:"indexTerms"`
+}
+
+type wireSearchResp struct {
+	ItemCount int          `json:"itemCount"`
+	Items     []wireRecord `json:"items"`
+}
+
+type wireCountResp struct {
+	ItemCount int `json:"itemCount"`
+}
+
+// --- public types ---
+
+// Record is a single digitized natural history specimen record from iDigBio.
+type Record struct {
+	ID             string `json:"id"               kit:"id"`
+	ScientificName string `json:"scientific_name"`
+	Family         string `json:"family,omitempty"`
+	Genus          string `json:"genus,omitempty"`
+	Country        string `json:"country,omitempty"`
+	Continent      string `json:"continent,omitempty"`
+	BasisOfRecord  string `json:"basis_of_record,omitempty"`
+	Institution    string `json:"institution,omitempty"`
+	CatalogNumber  string `json:"catalog_number,omitempty"`
+	Collector      string `json:"collector,omitempty"`
+	DateCollected  string `json:"date_collected,omitempty"`
+	TypeStatus     string `json:"type_status,omitempty"`
+	HasMedia       bool   `json:"has_media,omitempty"`
+}
+
+// CountResult holds the total specimen record count.
+type CountResult struct {
+	Total int `json:"total"`
+}
+
+// --- client methods ---
+
+// SearchRecords searches for specimen records by scientific name.
+// It returns up to limit records starting at offset, and the total count.
+func (c *Client) SearchRecords(ctx context.Context, scientificName string, limit, offset int) ([]*Record, int, error) {
+	url := fmt.Sprintf("%s/search/records/?limit=%d&offset=%d", BaseURL, limit, offset)
+	payload, err := json.Marshal(map[string]any{"rq": map[string]string{"scientificname": scientificName}})
+	if err != nil {
+		return nil, 0, fmt.Errorf("encode search body: %w", err)
+	}
+
+	body, err := c.Post(ctx, url, payload)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	var resp wireSearchResp
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, 0, fmt.Errorf("decode search records: %w", err)
+	}
+
+	out := make([]*Record, 0, len(resp.Items))
+	for _, w := range resp.Items {
+		out = append(out, recordFromWire(w))
+	}
+	return out, resp.ItemCount, nil
+}
+
+// ListRecords lists all specimen records, up to limit starting at offset.
+// It returns the records and the total count.
+func (c *Client) ListRecords(ctx context.Context, limit, offset int) ([]*Record, int, error) {
+	url := fmt.Sprintf("%s/search/records/?limit=%d&offset=%d", BaseURL, limit, offset)
+	payload, err := json.Marshal(map[string]any{"rq": map[string]any{}})
+	if err != nil {
+		return nil, 0, fmt.Errorf("encode list body: %w", err)
+	}
+
+	body, err := c.Post(ctx, url, payload)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	var resp wireSearchResp
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, 0, fmt.Errorf("decode list records: %w", err)
+	}
+
+	out := make([]*Record, 0, len(resp.Items))
+	for _, w := range resp.Items {
+		out = append(out, recordFromWire(w))
+	}
+	return out, resp.ItemCount, nil
+}
+
+// GetRecord fetches a single specimen record by its UUID.
+func (c *Client) GetRecord(ctx context.Context, uuid string) (*Record, error) {
+	url := BaseURL + "/view/records/" + uuid
+
 	body, err := c.Get(ctx, url)
 	if err != nil {
 		return nil, err
 	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
+
+	var resp wireRecord
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode record: %w", err)
+	}
+	if resp.UUID == "" {
+		resp.UUID = uuid
+	}
+
+	return recordFromWire(resp), nil
 }
 
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
+// Count returns the total number of digitized specimen records in iDigBio.
+func (c *Client) Count(ctx context.Context) (int, error) {
+	url := BaseURL + "/summary/count/records/"
+
+	body, err := c.Get(ctx, url)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
+
+	var resp wireCountResp
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return 0, fmt.Errorf("decode count: %w", err)
 	}
-	return out, nil
+
+	return resp.ItemCount, nil
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
+// --- conversion helpers ---
 
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
+func recordFromWire(w wireRecord) *Record {
+	it := w.IndexTerms
+	return &Record{
+		ID:             w.UUID,
+		ScientificName: it.ScientificName,
+		Family:         it.Family,
+		Genus:          it.Genus,
+		Country:        it.Country,
+		Continent:      it.Continent,
+		BasisOfRecord:  it.BasisOfRecord,
+		Institution:    it.InstitutionCode,
+		CatalogNumber:  it.CatalogNumber,
+		Collector:      it.Collector,
+		DateCollected:  it.DateCollected,
+		TypeStatus:     it.TypeStatus,
+		HasMedia:       it.HasMedia,
 	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
 }
